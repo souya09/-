@@ -1,0 +1,335 @@
+VERSION 1.0 CLASS
+
+BEGIN
+ MultiUse = -1  'True
+END
+
+Attribute VB_Name = "ExcelGrep"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+
+Option Explicit
+
+'-----------------------
+' プライベート変数の宣言
+'-----------------------
+Private MainSheet           As Worksheet ' メインシート (検索結果の表示などに使用)
+Private TargetPathCell      As Range     ' 検索対象フォルダのセル
+Private SearchPatternCell   As Range     ' 検索パターンを入力するセル
+Private ResultListFirstCell As Range     ' 検索結果リストの最初のセル
+Private ShouldSearch        As Boolean   ' 検索実行中かどうかを示すフラグ
+Private FSO                 As New FileSystemObject ' ファイル操作用オブジェクト
+Private REG                 As New VBScript_RegExp_55.RegExp ' 正規表現オブジェクト
+Private InvisibleExcel      As Excel.Application ' 非表示のExcelインスタンス (ファイル読み取りに使用)
+
+'---------------------------
+' 列インデックスを列挙型で定義
+'---------------------------
+Private Enum ResultColumns
+   Path = 1  ' ファイルパス
+   Book = 2  ' ブック名
+   Sheet = 3 ' シート名
+   Name = 4  ' オブジェクト名 (セルや図形)
+   Value = 5 ' 値
+End Enum
+
+'---------------------------------
+' クラス初期化処理
+'---------------------------------
+Private Sub Class_Initialize()
+   ' 必要なセルやシートを設定
+   Set MainSheet = ThisWorkbook.Sheets("ExcelGrep")
+   Set TargetPathCell = MainSheet.Range("C3")
+   Set SearchPatternCell = MainSheet.Range("C4")
+   Set ResultListFirstCell = MainSheet.Range("C7")
+   ShouldSearch = False ' 検索フラグを初期化
+End Sub
+
+'---------------------------------
+' フォルダ選択ダイアログを表示
+'---------------------------------
+Public Sub PickupFolderPath(Msg As String)
+   Dim FolderPicker As FileDialog
+   Dim Result As String
+   Set FolderPicker = Application.FileDialog(msoFileDialogFolderPicker)
+  
+   FolderPicker.Title = Msg ' ダイアログタイトルを設定
+   If FolderPicker.Show Then Result = FolderPicker.SelectedItems(1) ' 選択されたフォルダを取得
+   If Result = "" Then Exit Sub
+  
+   TargetPathCell.Value = Result ' 選択したフォルダパスをセルに設定
+End Sub
+
+'---------------------------------
+' 検索処理を実行
+'---------------------------------
+Public Sub ExecSearch(Optional IgnoreCase As Boolean = True)
+   Dim SpecifiedFolder As Folder: Set SpecifiedFolder = GetSpecifiedFolder()
+   
+   ' フォルダが見つからない場合
+   If SpecifiedFolder Is Nothing Then
+       MsgBox "検索対象フォルダが見つかりませんでした。", vbInformation, ThisWorkbook.Name
+       Exit Sub
+   End If
+   
+   ' 検索文字列が未入力の場合
+   If Trim(SearchPatternCell.Value) = "" Then
+       MsgBox "検索文字列を入力してください。", vbInformation, ThisWorkbook.Name
+       Exit Sub
+   End If
+  
+   ' 検索中の場合は処理を中止
+   If ShouldSearch = True Then
+       MsgBox "別の検索処理がすでに実行中です。", vbInformation, ThisWorkbook.Name
+       Exit Sub
+   End If
+  
+   ' 正規表現を設定
+   REG.Global = True
+   REG.IgnoreCase = IgnoreCase
+   REG.Pattern = SearchPatternCell.Value
+  
+   ' 検索フラグをオンにして検索開始
+   ShouldSearch = True
+   Call ClearResultList
+   Call SearchFolder(SpecifiedFolder)
+  
+   ' 検索終了後にリソース解放
+   If Not InvisibleExcel Is Nothing Then
+       InvisibleExcel.Quit
+       Set InvisibleExcel = Nothing
+   End If
+  
+   ShouldSearch = False
+   Call DisplayStatus("")
+   MsgBox "検索が終了しました。", vbInformation, ThisWorkbook.Name
+End Sub
+
+'---------------------------------
+' 検索処理の中断
+'---------------------------------
+Public Sub Interrupt()
+   If ShouldSearch = False Then Exit Sub
+   If MsgBox("検索を中止してもよろしいですか?", vbYesNo Or vbQuestion, ThisWorkbook.Name) <> vbYes Then Exit Sub
+  
+   ShouldSearch = False ' 検索フラグをオフにする
+End Sub
+
+'---------------------------------
+' 結果リストをクリア
+'---------------------------------
+Public Sub ClearResultList()
+   ResultListFirstCell.CurrentRegion.Offset(2).Delete ' 結果リストのデータを削除
+End Sub
+
+'---------------------------------
+' 指定したフォルダを取得
+'---------------------------------
+Private Function GetSpecifiedFolder() As Folder
+   On Error Resume Next
+   Dim SpecifiedFolder As Folder
+   Set SpecifiedFolder = FSO.GetFolder(TargetPathCell.Value)
+   Set GetSpecifiedFolder = SpecifiedFolder
+End Function
+
+'---------------------------------
+' 指定フォルダ内の検索
+'---------------------------------
+Private Sub SearchFolder(objFolder As Folder)
+   If ShouldSearch = False Then Exit Sub
+  
+   Dim objFile As File
+   Dim SubFolder As Folder
+  
+   ' フォルダ内のすべてのファイルを検索
+   Call DisplayStatus(objFolder.Path)
+   For Each objFile In objFolder.Files
+       Select Case FSO.GetExtensionName(objFile.Path)
+           Case "xls", "xlsx", "xlsm" ' 対象となるExcelファイル
+               Call SearchBook(objFile)
+       End Select
+   Next
+  
+   ' サブフォルダ内も再帰的に検索
+   For Each SubFolder In objFolder.SubFolders
+       Call SearchFolder(SubFolder)
+   Next
+End Sub
+
+'---------------------------------
+' 指定ファイル内の検索
+'---------------------------------
+Private Sub SearchBook(objFile As File)
+   If ShouldSearch = False Then Exit Sub
+  
+   On Error Resume Next
+   If InvisibleExcel Is Nothing Then
+       Set InvisibleExcel = New Excel.Application
+       InvisibleExcel.Visible = False
+       InvisibleExcel.ScreenUpdating = False
+   End If
+  
+   Dim Book As Workbook: Set Book = InvisibleExcel.Workbooks.Open(Filename:=objFile.Path, ReadOnly:=True)
+   If Book Is Nothing Then
+       MsgBox objFile.Path & vbCrLf & " が開けませんでした。"
+       Exit Sub
+   End If
+   On Error GoTo 0
+  
+   Dim Sheet As Worksheet
+   For Each Sheet In Book.Worksheets
+       Call SearchSheet(Sheet)
+   Next
+  
+   Call Book.Close(SaveChanges:=False)
+End Sub
+
+'---------------------------------
+' 指定シート内の検索
+'---------------------------------
+Private Sub SearchSheet(Sheet As Worksheet)
+   If ShouldSearch = False Then Exit Sub
+  
+   Dim TargetRange As Range
+   Dim Cell As Range
+
+   ' シート内のセルを検索
+   Set TargetRange = Sheet.UsedRange.Cells
+   For Each Cell In TargetRange
+       DoEvents
+       Call DisplayStatus(Sheet.Parent.FullName)
+      
+       If Cell.Value <> "" Then
+           If REG.Test(Cell.Value) Then
+               Call ProcessCell(Cell)
+           End If
+       End If
+   Next
+  
+   ' シート内の図形を検索
+   Dim objShape As Shape
+   For Each objShape In Sheet.Shapes
+       DoEvents
+       Call DisplayStatus(Sheet.Parent.FullName)
+      
+       If HasTextFrameCharactersText(objShape) Then
+           If REG.Test(objShape.TextFrame.Characters.Text) Then
+               Call ProcessShape(objShape)
+           End If
+       End If
+   Next
+End Sub
+
+'---------------------------------
+' 図形内のテキストを確認
+'---------------------------------
+Private Function HasTextFrameCharactersText(objShape As Shape) As Boolean
+   On Error Resume Next
+   Dim Text As String
+   Text = objShape.TextFrame.Characters.Text
+   HasTextFrameCharactersText = (Text <> "")
+End Function
+
+'---------------------------------
+' 一致したセルを処理
+'---------------------------------
+Private Sub ProcessCell(Cell As Range)
+   Call SetNewRowData(FoundSheet:=Cell.Parent, Name:=Cell.Address, Value:=Cell.Value)
+End Sub
+
+'---------------------------------
+' 一致した図形を処理
+'---------------------------------
+Private Sub ProcessShape(objShape As Shape)
+   Call SetNewRowData(FoundSheet:=objShape.Parent, Name:=objShape.Name, Value:=objShape.TextFrame.Characters.Text)
+End Sub
+
+'---------------------------------
+' 検索結果を新しい行に追加
+'---------------------------------
+Private Sub SetNewRowData(FoundSheet As Worksheet, Name As String, Value As String)
+   Dim Row As Range: Set Row = GetNewRow()
+   Dim PathCell As Range: Set PathCell = Row.Cells(ResultColumns.Path)
+   Dim BookCell As Range: Set BookCell = Row.Cells(ResultColumns.Book)
+  
+   ' パス
+   PathCell.Value = FoundSheet.Parent.FullName
+   PathCell.WrapText = False
+   Call MainSheet.Hyperlinks.Add(Anchor:=PathCell, Address:=PathCell.Value)
+   ' ブック
+   BookCell.Value = FoundSheet.Parent.Name
+   Call MainSheet.Hyperlinks.Add(Anchor:=BookCell, Address:=PathCell.Value)
+   ' シート
+   Row.Cells(ResultColumns.Sheet).Value = FoundSheet.Name
+   ' 名前
+   Row.Cells(ResultColumns.Name).Value = Name
+   ' 値
+   Row.Cells(ResultColumns.Value).Value = Value
+   Row.Cells(ResultColumns.Value).WrapText = False
+   '--- 罫線 ---
+   Row.Borders.LineStyle = xlContinuous
+End Sub
+
+'---------------------------------
+' 新しい行を取得
+'---------------------------------
+Private Function GetNewRow() As Range
+   Dim ListRange As Range: Set ListRange = GetResultListRange
+   Dim NewRowIndex As Long: NewRowIndex = ListRange.Rows.Count + 1
+   Set GetNewRow = ListRange.Rows(NewRowIndex)
+End Function
+
+'---------------------------------
+' 検索結果の範囲を取得
+'---------------------------------
+Private Function GetResultListRange() As Range
+   Dim ListRowsCount As Long: ListRowsCount = ResultListFirstCell.CurrentRegion.Rows.Count - 1
+   Set GetResultListRange = ResultListFirstCell.CurrentRegion.Offset(1).Resize(ListRowsCount)
+End Function
+
+'---------------------------------
+' ステータスバーに進行状況を表示
+'---------------------------------
+Private Sub DisplayStatus(Msg As String)
+   Const DotsLen As Integer = 5
+   Dim Dots As String: Dots = String((Math.Rnd * DotsLen), ".")
+   Dim Loading As String: Loading = Left(Dots & String(DotsLen, " "), DotsLen)
+   Dim strDisplay As String: strDisplay = "検索中" & Loading & " " & Msg
+   Application.StatusBar = IIf(Msg = "", "", strDisplay)
+   DoEvents
+End Sub
+
+'---------------------------------
+' ハイパーリンクを追跡
+'---------------------------------
+Public Sub FollowHyperlink(Target As Hyperlink)
+   If Not IsIncludedInListRange(Target.Range) Then Exit Sub
+  
+   Dim SourceCell As Range: Set SourceCell = Target.Range
+   Dim SourceSheet As Worksheet: Set SourceSheet = SourceCell.Parent
+   Dim SourceRow As Range: Set SourceRow = SourceSheet.Range(SourceCell.End(xlToRight).End(xlToLeft), SourceCell.End(xlToRight))
+   Dim SheetName As String: SheetName = SourceRow.Cells(ResultColumns.Sheet)
+   Dim ObjectName As String: ObjectName = SourceRow.Cells(ResultColumns.Name)
+   Dim Book As Workbook: Set Book = ActiveSheet.Parent
+  
+   On Error Resume Next
+   Dim IsRangeObject As Boolean: IsRangeObject = (ObjectName Like "$*")
+   Dim DistSheet As Worksheet: Set DistSheet = Book.Sheets(SheetName)
+   DistSheet.Activate
+   If IsRangeObject Then
+       DistSheet.Range(ObjectName).Activate
+   Else
+       DistSheet.Shapes(ObjectName).Select
+   End If
+End Sub
+
+'---------------------------------
+' 検索結果範囲に含まれているか確認
+'---------------------------------
+Private Function IsIncludedInListRange(Target As Range) As Boolean
+   Dim ResultRange As Range
+   Set ResultRange = Application.Intersect(GetResultListRange, Target)
+   IsIncludedInListRange = Not ResultRange Is Nothing
+End Function
